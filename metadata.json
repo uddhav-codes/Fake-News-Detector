@@ -1,0 +1,6 @@
+{
+  "name": "Veritas Lens - News Integrity & ML Verification Lab",
+  "description": "An investigative news verification suite and machine learning lab for detecting disinformation, clickbait, and synthetic editorial bias.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
