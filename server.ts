@@ -3,8 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import express from 'express';
-import type { Request, Response } from 'express';
+import express, { Request, Response } from 'express';
 import * as cheerio from 'cheerio';
 import puppeteer from 'puppeteer';
 import path from 'path';
@@ -15,14 +14,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = 3000;
 
 const ai = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
 
 app.use(express.json({ limit: '10mb' }));
 
-// Headless Chromium JavaScript rendering function for dynamic SPAs and modern news sites
-async function scrapeWithPuppeteer(targetUrl: string): Promise<{ title: string; articleText: string; publishDate?: string }> {
+// Headless Chromium rendering with bot evasion
+async function scrapeWithPuppeteer(targetUrl: string): Promise<{ title: string; articleText: string; publishDate?: string; metaDescription?: string }> {
   const browser = await puppeteer.launch({
     headless: true,
     args: [
@@ -33,13 +32,19 @@ async function scrapeWithPuppeteer(targetUrl: string): Promise<{ title: string; 
       '--no-first-run',
       '--no-zygote',
       '--single-process',
-      '--disable-extensions'
+      '--disable-extensions',
+      '--disable-blink-features=AutomationControlled'
     ]
   });
 
   try {
     const page = await browser.newPage();
-    // Intercept and skip heavy images and media to keep JS rendering swift
+
+    // Mask Puppeteer navigator.webdriver
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       try {
@@ -49,9 +54,7 @@ async function scrapeWithPuppeteer(targetUrl: string): Promise<{ title: string; 
         } else {
           req.continue().catch(() => {});
         }
-      } catch {
-        // Safe catch
-      }
+      } catch {}
     });
 
     await page.setUserAgent(
@@ -61,36 +64,36 @@ async function scrapeWithPuppeteer(targetUrl: string): Promise<{ title: string; 
 
     await page.goto(targetUrl, {
       waitUntil: 'domcontentloaded',
-      timeout: 10000
+      timeout: 15000
     });
 
-    // Give dynamic client hydration a moment
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 1200));
 
     const data = await page.evaluate(() => {
-      // Clean noise elements
       const noise = document.querySelectorAll(
         'script, style, nav, footer, header, aside, .advertisement, .ad, .social-share, noscript, iframe, .cookie-banner, #cookie-consent'
       );
       noise.forEach((n) => n.remove());
 
-      // Extract title
       const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content');
       const twTitle = document.querySelector('meta[name="twitter:title"]')?.getAttribute('content');
       const h1 = document.querySelector('h1')?.innerText?.trim();
       const docTitle = document.title?.trim();
       let extractedTitle = ogTitle || twTitle || h1 || docTitle || '';
-
       extractedTitle = extractedTitle.replace(/\s*([|–—-])\s*(Reuters|BBC News|CNN|The New York Times|Fox News|AP News|The Guardian).*$/i, '').trim();
 
-      // Extract publication date metadata
+      const ogDesc = document.querySelector('meta[property="og:description"]')?.getAttribute('content');
+      const twDesc = document.querySelector('meta[name="twitter:description"]')?.getAttribute('content');
+      const metaDesc = document.querySelector('meta[name="description"]')?.getAttribute('content');
+      const metaDescription = ogDesc || twDesc || metaDesc || '';
+
       const pubMeta = document.querySelector(
         'meta[property="article:published_time"], meta[name="pubdate"], meta[name="publishdate"], meta[name="date"], meta[property="og:article:published_time"]'
       )?.getAttribute('content');
       const timeEl = document.querySelector('time[datetime]')?.getAttribute('datetime') || document.querySelector('time')?.innerText?.trim();
       const publishDate = pubMeta || timeEl || '';
 
-      // Extract article paragraphs
+      // Paragraph extraction
       const articleEl = document.querySelector('article, [itemprop="articleBody"], .article-body, .story-body, .post-content, main');
       const container = articleEl || document.body;
       const paragraphs: string[] = [];
@@ -111,11 +114,7 @@ async function scrapeWithPuppeteer(targetUrl: string): Promise<{ title: string; 
       }
 
       let text = paragraphs.join('\n\n');
-      if (!text || text.length < 50) {
-        text = (document.body?.innerText || '').slice(0, 5000).trim();
-      }
-
-      return { title: extractedTitle, articleText: text, publishDate };
+      return { title: extractedTitle, articleText: text, publishDate, metaDescription };
     });
 
     return data;
@@ -124,7 +123,7 @@ async function scrapeWithPuppeteer(targetUrl: string): Promise<{ title: string; 
   }
 }
 
-// Full news article scraper supporting fast static extraction and headless JavaScript rendering
+// Scraper endpoint with multi-tier fallback
 app.post('/api/scrape-article', async (req: Request, res: Response): Promise<void> => {
   try {
     const { url, renderJs } = req.body;
@@ -142,19 +141,17 @@ app.post('/api/scrape-article', async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    console.log(`[Scraper] Fetching link: ${parsedUrl.href} (renderJs: ${Boolean(renderJs)})`);
-
     let articleText = '';
     let title = '';
     let publishDate = '';
+    let metaDescription = '';
     let renderedWith = 'static';
 
-    // 1. Fast static extraction attempt first (resolves 90% of news links in under 300ms)
+    // Tier 1: Fast Static Extraction + JSON-LD Schema
     try {
       const response = await fetch(parsedUrl.href, {
         headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
         },
@@ -165,72 +162,84 @@ app.post('/api/scrape-article', async (req: Request, res: Response): Promise<voi
         const html = await response.text();
         const $ = cheerio.load(html);
 
-        $('script, style, nav, footer, header, aside, .advertisement, .ad, .social-share, noscript, iframe').remove();
-
         title = $('meta[property="og:title"]').attr('content') ||
                 $('meta[name="twitter:title"]').attr('content') ||
-                $('h1').first().text().trim() ||
-                $('title').text().trim() ||
-                '';
+                $('h1').first().text().trim() \vert{}\vert{}$('title').text().trim() || '';
         title = title.replace(/\s*([|–—-])\s*(Reuters|BBC News|CNN|The New York Times|Fox News|AP News|The Guardian).*$/i, '').trim();
+
+        metaDescription = $('meta[property="og:description"]').attr('content') ||
+                          $('meta[name="twitter:description"]').attr('content') ||
+                          $('meta[name="description"]').attr('content') || '';
 
         publishDate = $('meta[property="article:published_time"]').attr('content') ||
                       $('meta[name="pubdate"]').attr('content') ||
-                      $('meta[name="publishdate"]').attr('content') ||
-                      $('meta[name="date"]').attr('content') ||
-                      $('meta[property="og:article:published_time"]').attr('content') ||
-                      $('time[datetime]').first().attr('datetime') ||
-                      $('time').first().text().trim() ||
-                      '';
+                      $('time[datetime]').first().attr('datetime') \vert{}\vert{}$('time').first().text().trim() || '';
 
-        const articleContainer = $('article, [itemprop="articleBody"], .article-body, .story-body, .post-content, main');
-        if (articleContainer.length > 0) {
-          const paragraphs: string[] = [];
-          articleContainer.find('p').each((_, el) => {
-            const text = $(el).text().trim();
-            if (text.length > 25) {
-              paragraphs.push(text);
+        // Extract structured JSON-LD (often bypasses paywalls)
+        $('script[type="application/ld+json"]').each((_, el) => {
+          try {
+            const raw = $(el).html();
+            if (raw) {
+              const data = JSON.parse(raw);
+              const target = Array.isArray(data) ? data[0] : (data['@graph'] ? data['@graph'].find((item: any) => item.articleBody || item.description) : data);
+              if (target?.articleBody && typeof target.articleBody === 'string' && target.articleBody.length > articleText.length) {
+                articleText = target.articleBody;
+              }
+              if (!metaDescription && target?.description) {
+                metaDescription = target.description;
+              }
             }
-          });
-          articleText = paragraphs.join('\n\n');
-        }
+          } catch {}
+        });
 
+        // Fallback to DOM paragraphs if JSON-LD had no full body
         if (!articleText || articleText.length < 120) {
+          const articleContainer = $('article, [itemprop="articleBody"], .article-body, .story-body, .post-content, main');
+          const targetEl = articleContainer.length > 0 ? articleContainer : $('body');
           const paragraphs: string[] = [];
-          $('p').each((_, el) => {
+
+          targetEl.find('p').each((_, el) => {
             const text = $(el).text().trim();
-            if (text.length > 35 && !text.includes('cookie') && !text.includes('privacy policy') && !text.includes('All rights reserved')) {
+            if (text.length > 25 && !text.includes('cookie') && !text.includes('privacy policy') && !text.includes('All rights reserved')) {
               paragraphs.push(text);
             }
           });
-          articleText = paragraphs.join('\n\n');
+          if (paragraphs.length > 0) {
+            articleText = paragraphs.join('\n\n');
+          }
         }
       }
     } catch (staticErr: any) {
-      console.warn(`[Scraper] Fast static fetch encountered issue, will use headless browser:`, staticErr.message);
+      console.warn(`[Scraper] Fast fetch error:`, staticErr.message);
     }
 
-    // 2. Headless JavaScript Rendering Engine: Triggers automatically for client-side SPAs or if static fetch was insufficient
+    // Tier 2: Headless Browser Fallback
     if (!articleText || articleText.length < 120) {
       try {
-        console.log(`[Scraper] Triggering headless JavaScript rendering for: ${parsedUrl.href}`);
         const rendered = await scrapeWithPuppeteer(parsedUrl.href);
         if (rendered.articleText && rendered.articleText.length >= 50) {
           articleText = rendered.articleText;
-          if (rendered.title) title = rendered.title;
-          if (rendered.publishDate) publishDate = rendered.publishDate;
           renderedWith = 'javascript';
         }
-      } catch (jsFallbackErr: any) {
-        console.warn(`[Scraper] JavaScript rendering fallback error:`, jsFallbackErr.message);
+        if (rendered.title && !title) title = rendered.title;
+        if (rendered.publishDate && !publishDate) publishDate = rendered.publishDate;
+        if (rendered.metaDescription && !metaDescription) metaDescription = rendered.metaDescription;
+      } catch (jsErr: any) {
+        console.warn(`[Scraper] Headless browser fallback error:`, jsErr.message);
       }
     }
 
+    // Tier 3: Metadata Fallback (prevents 422 errors on paywalled links)
     if (!articleText || articleText.length < 50) {
-      res.status(422).json({
-        error: 'Could not extract readable article text from this webpage even with JavaScript rendering enabled. The page may require a subscription login or paywall.',
-      });
-      return;
+      if (metaDescription || title) {
+        articleText = [title, metaDescription].filter(Boolean).join('\n\n');
+        renderedWith = 'metadata-summary';
+      } else {
+        res.status(422).json({
+          error: 'Could not extract article content or metadata from this webpage. Try testing in Headline / Text mode instead.',
+        });
+        return;
+      }
     }
 
     const snippet = articleText.length > 300 ? `${articleText.slice(0, 300)}...` : articleText;
@@ -246,7 +255,6 @@ app.post('/api/scrape-article', async (req: Request, res: Response): Promise<voi
       wordCount: articleText.split(/\s+/).filter(Boolean).length,
     });
   } catch (err: any) {
-    console.error('[Scraper Error]', err);
     res.status(500).json({
       error: `Scraping error: ${err.message || 'Unable to fetch webpage.'}`,
     });
@@ -291,7 +299,7 @@ interface WebNewsArticle {
   link: string;
 }
 
-// Live web search across news publications and wire services (Google News RSS engine)
+// Live web search using Google News RSS
 async function searchRecentNewsOnWeb(queryText: string): Promise<WebNewsArticle[]> {
   try {
     const cleanQuery = queryText
@@ -341,7 +349,7 @@ async function searchRecentNewsOnWeb(queryText: string): Promise<WebNewsArticle[
   }
 }
 
-// Accurate News Verification Endpoint (AI Fact-Checking with Gemini & Live Web Grounding)
+// News Verification Endpoint with Gemini
 app.post('/api/verify-headline', async (req: Request, res: Response): Promise<void> => {
   try {
     const { headline, body, url, domain, publishDate } = req.body;
@@ -352,7 +360,6 @@ app.post('/api/verify-headline', async (req: Request, res: Response): Promise<vo
 
     const cleanDomain = extractCleanDomain(domain || url);
 
-    // Fast-path: Known parody/satire domains
     if (cleanDomain && KNOWN_SATIRE_DOMAINS.some(d => cleanDomain.endsWith(d))) {
       res.json({
         success: true,
@@ -367,7 +374,6 @@ app.post('/api/verify-headline', async (req: Request, res: Response): Promise<vo
       return;
     }
 
-    // 1. Fetch live recent news articles from the web for real-time journalistic cross-referencing
     const recentWebArticles = await searchRecentNewsOnWeb(headline);
 
     if (ai) {
@@ -382,73 +388,37 @@ app.post('/api/verify-headline', async (req: Request, res: Response): Promise<vo
 
       const prompt = `You are an elite news verification and journalistic fact-checking intelligence system.
 
-======================================================================
-MANDATORY TEMPORAL & CALENDAR GROUNDING (PREVENTS FALSE FUTURE BIAS):
-- CURRENT REAL-WORLD DATE TODAY: ${currentDateStr} (Year: ${currentYear}).
-- CURRENT YEAR: ${currentYear}.
-- STRICT TEMPORAL EVALUATION RULES:
-  1. The calendar year today is ${currentYear}. ALL historical and recent news events that occurred in 2024, 2025, or early ${currentYear} (and all preceding years: 2000-2023) ARE ALREADY IN THE PAST.
-  2. NEVER confuse past events with future events. NEVER classify a real event from 2024, 2025, or prior as "fake news" under the mistaken assumption that it "has not happened yet" or is "a future prediction".
-     * E.g., The 2024 US Presidential Election already took place in 2024. Donald Trump was elected 47th President and took office in January 2025.
-     * E.g., Joe Biden withdrew from the 2024 presidential election in July 2024.
-     * E.g., The 2024 Paris Summer Olympics concluded in August 2024.
-     * E.g., The Francis Scott Key Bridge collapse in Baltimore occurred in March 2024.
-     * E.g., The Total Solar Eclipse across North America occurred on April 8, 2024.
-  3. Real historical news archives (from any past year: 2016, 2018, 2020, 2022, 2024) are credible REAL NEWS.
-  4. If an article was published in the past, it may use future or present tense relative to its publication date (e.g., "NASA to launch telescope next month"). Do not label authentic past reporting as fake simply because the scheduled event date has already passed.
-======================================================================
+CURRENT REAL-WORLD DATE TODAY: ${currentDateStr} (Year: ${currentYear}).
 
-LIVE RECENT ARTICLES FOUND ON THE WEB (JOURNALISTIC GROUND-TRUTH CROSS-REFERENCE):
+LIVE RECENT ARTICLES FOUND ON THE WEB:
 ${
   recentWebArticles.length > 0
     ? recentWebArticles
-        .map((a, i) => `${i + 1}. [Source: ${a.source} | Date: ${a.pubDate || 'Recent'}]: "${a.title}"`)
+        .map((a, i) => `${i + 1}.: "${a.title}"`)
         .join('\n')
     : 'No directly matching news wire articles retrieved from the web for this exact query.'
 }
-======================================================================
 
 ARTICLE UNDER EVALUATION:
 Headline: "${headline}"
 ${cleanDomain ? `Source Domain: "${cleanDomain}"` : ''}
 ${publishDate ? `Article Publication Date: "${publishDate}"` : ''}
-${body ? `Article Content: "${body.slice(0, 3500)}"` : ''}
+${body ? `Article Content / Summary: "${body.slice(0, 3500)}"` : ''}
 
 VERIFICATION PROTOCOL:
-
-1. WEB CORROBORATION & FACT-CHECKING:
-   - Check if the recent articles retrieved from the web corroborate the occurrence of this event.
-   - If reputable news organizations (Reuters, AP, BBC, CNN, WSJ, etc.) reported on this event, confirm it as REAL NEWS (isReal: true).
-   - If a major or catastrophic assertion (e.g., world war, assassination, sudden resignation, alien invasion) has ZERO corroboration on any web news wires, classify as FAKE NEWS (isReal: false).
-
-2. CORE EVENT AUTHENTICITY:
-   - Does this describe a genuine real-world event, development, policy, scientific finding, or incident supported by reputable journalism or historical public record through ${currentDateStr}?
-   - If YES, classify as REAL NEWS (isReal: true).
-
-3. TEMPORAL & DATE ACCURACY:
-   - If the headline or text refers to a real event that occurred in 2024, 2025, or earlier, evaluate it as a real past event. DO NOT classify it as fake news because of model pre-training date cutoffs.
-
-4. FABRICATED HOAXES, CONSPIRACY THEORIES, & DISINFORMATION:
-   - Does it assert an unprecedented, monumental, or catastrophic claim that never happened in historical reality (e.g., world war declared, sitting president assassinated/secretly arrested, celebrity death hoaxes, secret cures hidden by conspirators, false-flag conspiracies)?
-   - If YES, classify as FAKE NEWS (isReal: false).
-
-5. SATIRE, PARODY, & FICTION:
-   - Is the article or headline written as comedic parody, satire, or clickbait fiction?
-   - If YES, classify as FAKE NEWS (isReal: false).
-
-6. STANDARD OBJECTIVE JOURNALISM:
-   - Routine, plausible events (traffic accidents, regulatory decisions, corporate reports, local government actions, court rulings, weather phenomena, sports match results) that align with everyday reality and follow journalistic structure are credible REAL NEWS (isReal: true).
+1. If the headline/content matches real events corroborated by reliable sources or reputable reporting, classify as REAL (isReal: true).
+2. If the headline asserts major events (death hoaxes, war declarations, impossible claims) with zero corroboration, classify as FAKE (isReal: false).
+3. Do not reject real historical or recent events due to training cutoffs.
 
 Respond strictly in valid JSON format:
 {
   "isReal": boolean,
-  "confidence": number (percentage between 85.0 and 99.9 reflecting certainty),
+  "confidence": number,
   "verdict": "reliable" | "unreliable",
   "reason": "1 concise, factual sentence explaining the veracity determination with accurate date/temporal context and web cross-reference"
 }`;
 
-      // Try primary model (gemini-3.1-flash-lite), fall back to gemini-flash-latest on demand spikes
-      const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-flash-latest'];
+      const modelsToTry = ['gemini-2.5-flash', 'gemini-1.5-flash'];
       for (const modelName of modelsToTry) {
         try {
           const aiRes = await ai.models.generateContent({
@@ -460,7 +430,6 @@ Respond strictly in valid JSON format:
           });
 
           const rawText = aiRes.text?.trim() || '{}';
-          // Clean possible markdown code fences to prevent JSON parse syntax errors
           const cleanJson = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
           const parsed = JSON.parse(cleanJson);
           const isReal = Boolean(parsed.isReal);
@@ -496,7 +465,7 @@ Respond strictly in valid JSON format:
   }
 });
 
-// Mount Vite or static server
+// Static and SPA server
 async function startServer() {
   const isDev = process.env.NODE_ENV !== 'production';
 
