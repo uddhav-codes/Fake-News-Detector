@@ -418,7 +418,8 @@ Respond strictly in valid JSON format:
   "reason": "1 concise, factual sentence explaining the veracity determination with accurate date/temporal context and web cross-reference"
 }`;
 
-      const modelsToTry = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+      // Try primary model (gemini-3.8-flash), fall back to 1.5 if needed
+      const modelsToTry = ['gemini-3.8-flash', 'gemini-1.5-flash'];
       for (const modelName of modelsToTry) {
         try {
           const aiRes = await ai.models.generateContent({
